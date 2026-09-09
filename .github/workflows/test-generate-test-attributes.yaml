@@ -39,7 +39,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-24.04, windows-2022, macos-15]
+        include:
+          # Linux runs podman natively, the provider attribute stays empty there
+          - runner: ubuntu-24.04
+            provider: ''
+          - runner: windows-2022
+            provider: wsl
+          - runner: macos-15
+            provider: applehv
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -49,7 +56,7 @@ jobs:
         id: detected
         uses: ./.github/actions/generate-test-attributes
         with:
-          podman-provider: ${{ runner.os == 'Linux' && '' || 'wsl' }}
+          podman-provider: ${{ matrix.provider }}
           podman-version: 6.0.2
 
       # The tests would run on a VM provisioned in Azure, the runner only drives them
