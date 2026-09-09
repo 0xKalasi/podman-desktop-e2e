@@ -1,0 +1,103 @@
+# Copyright (C) 2026 Red Hat, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Smoke test for the generate-test-attributes action. It runs on GitHub hosted
+# runners only, it does not provision any instance in Azure.
+name: Test generate-test-attributes action
+
+on:
+  # Pushing a throwaway branch is enough to get the results, no pull request needed
+  push:
+    branches:
+      - 'test/**'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/actions/generate-test-attributes/action.yaml'
+      - '.github/workflows/test-generate-test-attributes.yaml'
+
+permissions:
+  contents: read
+
+jobs:
+  attributes:
+    name: ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, windows-2022, macos-15]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The runner is the machine under test, everything is detected
+      - name: Generate attributes from the runner
+        id: detected
+        uses: ./.github/actions/generate-test-attributes
+        with:
+          podman-provider: ${{ runner.os == 'Linux' && '' || 'wsl' }}
+          podman-version: 6.0.2
+
+      # The tests would run on a VM provisioned in Azure, the runner only drives them
+      - name: Generate attributes for a provisioned VM
+        uses: ./.github/actions/generate-test-attributes
+        with:
+          dir: results
+          podman-provider: hyperv
+          podman-version: 6.0.2
+          os: windows
+          os-version: 2025
+          extra-attributes: '{"podman-release": "6.0.2"}'
+
+      - name: Verify the generated attributes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "::group::Detected from the ${{ matrix.runner }} runner"
+          cat workflow-run-attributes.json
+          echo "::endgroup::"
+
+          echo "::group::Provisioned VM overrides"
+          cat results/workflow-run-attributes.json
+          echo "::endgroup::"
+
+          # Every attribute except podman-provider has to be filled in
+          for key in podman-version os os-version architecture platform repository; do
+            for file in workflow-run-attributes.json results/workflow-run-attributes.json; do
+              value=$(jq -r --arg key "$key" '.[$key] // ""' "$file")
+              if [ -z "$value" ]; then
+                echo "::error file=$file::Attribute '$key' is empty"
+                exit 1
+              fi
+            done
+          done
+
+          # The overrides have to win over the runner detection
+          jq -e '."os" == "windows" and ."os-version" == "2025" and ."platform" == "windows-nt" and ."podman-release" == "6.0.2"' \
+            results/workflow-run-attributes.json > /dev/null
+
+          echo "Action output attributes-file: ${{ steps.detected.outputs.attributes-file }}"
+
+      # Same glob the e2e workflows use, it has to pick up both files
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: attributes-${{ matrix.runner }}
+          path: |
+            **/workflow-run-attributes.json
