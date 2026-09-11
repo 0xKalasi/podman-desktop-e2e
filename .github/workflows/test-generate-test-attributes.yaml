@@ -33,6 +33,8 @@ permissions:
   contents: read
 
 jobs:
+  # What the action produces when it is called correctly. The expected values are
+  # pinned per runner, an empty attribute is not the only way this can break.
   attributes:
     name: ${{ matrix.runner }}
     runs-on: ${{ matrix.runner }}
@@ -43,10 +45,23 @@ jobs:
           # Linux runs podman natively, the provider attribute stays empty there
           - runner: ubuntu-24.04
             provider: ''
+            expected-os: ubuntu
+            expected-os-version: '24.04'
+            expected-platform: linux
+            expected-architecture: x86_64
           - runner: windows-2022
             provider: wsl
+            expected-os: windows
+            expected-os-version: '2022'
+            expected-platform: windows-nt
+            expected-architecture: x86_64
+          # The only runner in the matrix that is not x86_64
           - runner: macos-15
             provider: applehv
+            expected-os: macos
+            expected-os-version: '15'
+            expected-platform: darwin
+            expected-architecture: arm64
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -56,51 +71,122 @@ jobs:
         id: detected
         uses: ./.github/actions/generate-test-attributes
         with:
+          runs-on-gh-runner: true
           podman-provider: ${{ matrix.provider }}
           podman-version: 6.0.2
 
-      # The tests would run on a VM provisioned in Azure, the runner only drives them
+      # The tests would run on a VM provisioned in Azure, the runner only drives them.
+      # Nothing the runner reports about itself may end up in this file.
       - name: Generate attributes for a provisioned VM
+        id: provisioned
         uses: ./.github/actions/generate-test-attributes
         with:
+          runs-on-gh-runner: false
           dir: results
           podman-provider: hyperv
           podman-version: 6.0.2
           os: windows
-          os-version: 2025
+          os-version: '2025'
+          architecture: x86_64
           extra-attributes: '{"podman-release": "6.0.2"}'
+
+      # An input still wins over detection when the tests do run on the runner.
+      # This is also the only call that exercises the filename and repository inputs.
+      - name: Generate attributes with inputs overriding detection
+        id: overridden
+        uses: ./.github/actions/generate-test-attributes
+        with:
+          runs-on-gh-runner: true
+          filename: custom-attributes.json
+          repository: podman-desktop-companion
+          podman-version: 6.0.2
+          os: fedora
+          os-version: '42'
+          platform: linux
 
       - name: Verify the generated attributes
         shell: bash
+        env:
+          RUNNER_LABEL: ${{ matrix.runner }}
+          EXPECTED_PROVIDER: ${{ matrix.provider }}
+          EXPECTED_OS: ${{ matrix.expected-os }}
+          EXPECTED_OS_VERSION: ${{ matrix.expected-os-version }}
+          EXPECTED_PLATFORM: ${{ matrix.expected-platform }}
+          EXPECTED_ARCHITECTURE: ${{ matrix.expected-architecture }}
+          DETECTED_FILE: ${{ steps.detected.outputs.attributes-file }}
+          DETECTED_ATTRIBUTES: ${{ steps.detected.outputs.attributes }}
+          PROVISIONED_FILE: ${{ steps.provisioned.outputs.attributes-file }}
+          OVERRIDDEN_FILE: ${{ steps.overridden.outputs.attributes-file }}
         run: |
-          set -euo pipefail
+          # Every check runs, the step reports all of the failures at once
+          set -uo pipefail
+          fail=0
 
-          echo "::group::Detected from the ${{ matrix.runner }} runner"
-          cat workflow-run-attributes.json
-          echo "::endgroup::"
+          check() { # file key expected
+            actual=$(jq -r --arg key "$2" '.[$key] // ""' "$1")
+            if [ "${actual}" != "$3" ]; then
+              echo "::error file=$1::$2 is '${actual}', expected '$3'"
+              fail=1
+            fi
+          }
 
-          echo "::group::Provisioned VM overrides"
-          cat results/workflow-run-attributes.json
-          echo "::endgroup::"
+          check_prefix() { # file key expected-prefix
+            actual=$(jq -r --arg key "$2" '.[$key] // ""' "$1")
+            case "${actual}" in
+              "$3"*) ;;
+              *)
+                echo "::error file=$1::$2 is '${actual}', expected it to start with '$3'"
+                fail=1
+                ;;
+            esac
+          }
 
-          # Every attribute except podman-provider has to be filled in
-          for key in podman-version os os-version architecture platform repository; do
-            for file in workflow-run-attributes.json results/workflow-run-attributes.json; do
-              value=$(jq -r --arg key "$key" '.[$key] // ""' "$file")
-              if [ -z "$value" ]; then
-                echo "::error file=$file::Attribute '$key' is empty"
-                exit 1
-              fi
-            done
+          for file in "${DETECTED_FILE}" "${PROVISIONED_FILE}" "${OVERRIDDEN_FILE}"; do
+            echo "::group::${file}"
+            cat "${file}"
+            echo "::endgroup::"
           done
 
-          # The overrides have to win over the runner detection
-          jq -e '."os" == "windows" and ."os-version" == "2025" and ."platform" == "windows-nt" and ."podman-release" == "6.0.2"' \
-            results/workflow-run-attributes.json > /dev/null
+          # The action wrote the files where it says it did
+          [ "${DETECTED_FILE}" = "workflow-run-attributes.json" ] \
+            || { echo "::error::attributes-file is '${DETECTED_FILE}', expected the default name in the workspace root"; fail=1; }
+          [ "${PROVISIONED_FILE}" = "results/workflow-run-attributes.json" ] \
+            || { echo "::error::attributes-file is '${PROVISIONED_FILE}', the dir input was not applied"; fail=1; }
+          [ "${OVERRIDDEN_FILE}" = "custom-attributes.json" ] \
+            || { echo "::error::attributes-file is '${OVERRIDDEN_FILE}', the filename input was not applied"; fail=1; }
 
-          echo "Action output attributes-file: ${{ steps.detected.outputs.attributes-file }}"
+          # The attributes output has to be the same JSON as the file
+          jq -e --argjson output "${DETECTED_ATTRIBUTES}" '. == $output' "${DETECTED_FILE}" > /dev/null \
+            || { echo "::error::The attributes output does not match ${DETECTED_FILE}"; fail=1; }
 
-      # Same glob the e2e workflows use, it has to pick up both files
+          # 1. detected from the runner
+          check        "${DETECTED_FILE}" os              "${EXPECTED_OS}"
+          check_prefix "${DETECTED_FILE}" os-version      "${EXPECTED_OS_VERSION}"
+          check        "${DETECTED_FILE}" platform        "${EXPECTED_PLATFORM}"
+          check        "${DETECTED_FILE}" architecture    "${EXPECTED_ARCHITECTURE}"
+          check        "${DETECTED_FILE}" podman-provider "${EXPECTED_PROVIDER}"
+          check        "${DETECTED_FILE}" podman-version  "6.0.2"
+          check        "${DETECTED_FILE}" repository      "podman-desktop"
+
+          # 2. the provisioned VM, none of it comes from the ${RUNNER_LABEL} runner
+          check "${PROVISIONED_FILE}" os              "windows"
+          check "${PROVISIONED_FILE}" os-version      "2025"
+          check "${PROVISIONED_FILE}" architecture    "x86_64"
+          check "${PROVISIONED_FILE}" platform        "windows-nt"
+          check "${PROVISIONED_FILE}" podman-provider "hyperv"
+          check "${PROVISIONED_FILE}" podman-release  "6.0.2"
+
+          # 3. inputs beat detection, architecture is the only one left to detect
+          check "${OVERRIDDEN_FILE}" os           "fedora"
+          check "${OVERRIDDEN_FILE}" os-version   "42"
+          check "${OVERRIDDEN_FILE}" platform     "linux"
+          check "${OVERRIDDEN_FILE}" repository   "podman-desktop-companion"
+          check "${OVERRIDDEN_FILE}" architecture "${EXPECTED_ARCHITECTURE}"
+
+          exit "${fail}"
+
+      # Same glob the e2e workflows use, it has to pick up both files that keep
+      # the default name, no matter which folder they were written into
       - name: Upload test artifacts
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -108,3 +194,86 @@ jobs:
           name: attributes-${{ matrix.runner }}
           path: |
             **/workflow-run-attributes.json
+
+  # The guarantee the runs-on-gh-runner input exists for: a call that would tag the
+  # run with the wrong machine has to fail instead of quietly producing a file.
+  # None of this depends on the runner, one is enough.
+  validation:
+    name: input validation
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Reject a missing runs-on-gh-runner
+        id: missing-mode
+        continue-on-error: true
+        uses: ./.github/actions/generate-test-attributes
+        with:
+          filename: should-not-exist.json
+
+      - name: Reject an invalid runs-on-gh-runner
+        id: invalid-mode
+        continue-on-error: true
+        uses: ./.github/actions/generate-test-attributes
+        with:
+          runs-on-gh-runner: 'yes'
+          filename: should-not-exist.json
+
+      - name: Reject a provisioned run without any attribute
+        id: no-attributes
+        continue-on-error: true
+        uses: ./.github/actions/generate-test-attributes
+        with:
+          runs-on-gh-runner: false
+          filename: should-not-exist.json
+
+      - name: Reject a provisioned run with only some attributes
+        id: partial-attributes
+        continue-on-error: true
+        uses: ./.github/actions/generate-test-attributes
+        with:
+          runs-on-gh-runner: false
+          os: windows
+          filename: should-not-exist.json
+
+      - name: Reject extra-attributes that is not a JSON object
+        id: invalid-extra
+        continue-on-error: true
+        uses: ./.github/actions/generate-test-attributes
+        with:
+          runs-on-gh-runner: true
+          extra-attributes: 'not json'
+          filename: should-not-exist.json
+
+      - name: Verify every invalid call was rejected
+        shell: bash
+        env:
+          MISSING_MODE: ${{ steps.missing-mode.outcome }}
+          INVALID_MODE: ${{ steps.invalid-mode.outcome }}
+          NO_ATTRIBUTES: ${{ steps.no-attributes.outcome }}
+          PARTIAL_ATTRIBUTES: ${{ steps.partial-attributes.outcome }}
+          INVALID_EXTRA: ${{ steps.invalid-extra.outcome }}
+        run: |
+          set -uo pipefail
+          fail=0
+
+          for pair in \
+            "runs-on-gh-runner omitted:${MISSING_MODE}" \
+            "runs-on-gh-runner set to 'yes':${INVALID_MODE}" \
+            "a provisioned run without any attribute:${NO_ATTRIBUTES}" \
+            "a provisioned run with only os:${PARTIAL_ATTRIBUTES}" \
+            "extra-attributes that is not JSON:${INVALID_EXTRA}"; do
+            outcome="${pair##*:}"
+            if [ "${outcome}" != "failure" ]; then
+              echo "::error::The action accepted ${pair%:*} (outcome '${outcome}')"
+              fail=1
+            fi
+          done
+
+          # A rejected call must not leave a file behind either
+          if [ -f should-not-exist.json ]; then
+            echo "::error::A rejected call still wrote should-not-exist.json"
+            fail=1
+          fi
+
+          exit "${fail}"
