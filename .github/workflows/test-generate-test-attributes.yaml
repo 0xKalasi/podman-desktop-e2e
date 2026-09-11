@@ -118,26 +118,33 @@ jobs:
           PROVISIONED_FILE: ${{ steps.provisioned.outputs.attributes-file }}
           OVERRIDDEN_FILE: ${{ steps.overridden.outputs.attributes-file }}
         run: |
-          # Every check runs, the step reports all of the failures at once
+          # Every check runs, the step reports all of the failures at once. Each one
+          # also lands in the job summary, that is the single place to look at first.
           set -uo pipefail
           fail=0
+          checks=0
+          rows=""
+
+          record() { # file key expected actual
+            rows="${rows}| \`$1\` | \`$2\` | \`$3\` | \`$4\` |"$'\n'
+            echo "::error file=$1::$1: $2 is '$4', expected '$3'"
+            fail=1
+          }
 
           check() { # file key expected
+            checks=$((checks + 1))
             actual=$(jq -r --arg key "$2" '.[$key] // ""' "$1")
             if [ "${actual}" != "$3" ]; then
-              echo "::error file=$1::$2 is '${actual}', expected '$3'"
-              fail=1
+              record "$1" "$2" "$3" "${actual}"
             fi
           }
 
           check_prefix() { # file key expected-prefix
+            checks=$((checks + 1))
             actual=$(jq -r --arg key "$2" '.[$key] // ""' "$1")
             case "${actual}" in
               "$3"*) ;;
-              *)
-                echo "::error file=$1::$2 is '${actual}', expected it to start with '$3'"
-                fail=1
-                ;;
+              *) record "$1" "$2" "$3*" "${actual}" ;;
             esac
           }
 
@@ -147,17 +154,22 @@ jobs:
             echo "::endgroup::"
           done
 
+          check_output() { # what expected actual
+            checks=$((checks + 1))
+            if [ "$3" != "$2" ]; then
+              record "attributes-file output" "$1" "$2" "$3"
+            fi
+          }
+
           # The action wrote the files where it says it did
-          [ "${DETECTED_FILE}" = "workflow-run-attributes.json" ] \
-            || { echo "::error::attributes-file is '${DETECTED_FILE}', expected the default name in the workspace root"; fail=1; }
-          [ "${PROVISIONED_FILE}" = "results/workflow-run-attributes.json" ] \
-            || { echo "::error::attributes-file is '${PROVISIONED_FILE}', the dir input was not applied"; fail=1; }
-          [ "${OVERRIDDEN_FILE}" = "custom-attributes.json" ] \
-            || { echo "::error::attributes-file is '${OVERRIDDEN_FILE}', the filename input was not applied"; fail=1; }
+          check_output "default name in the workspace root" "workflow-run-attributes.json" "${DETECTED_FILE}"
+          check_output "dir input"                          "results/workflow-run-attributes.json" "${PROVISIONED_FILE}"
+          check_output "filename input"                     "custom-attributes.json" "${OVERRIDDEN_FILE}"
 
           # The attributes output has to be the same JSON as the file
+          checks=$((checks + 1))
           jq -e --argjson output "${DETECTED_ATTRIBUTES}" '. == $output' "${DETECTED_FILE}" > /dev/null \
-            || { echo "::error::The attributes output does not match ${DETECTED_FILE}"; fail=1; }
+            || record "${DETECTED_FILE}" "attributes output" "same JSON as the file" "different"
 
           # 1. detected from the runner
           check        "${DETECTED_FILE}" os              "${EXPECTED_OS}"
@@ -183,15 +195,29 @@ jobs:
           check "${OVERRIDDEN_FILE}" repository   "podman-desktop-companion"
           check "${OVERRIDDEN_FILE}" architecture "${EXPECTED_ARCHITECTURE}"
 
+          {
+            echo "## ${RUNNER_LABEL}"
+            echo
+            if [ -z "${rows}" ]; then
+              echo "All ${checks} attribute checks passed."
+            else
+              echo "| file | attribute | expected | actual |"
+              echo "| --- | --- | --- | --- |"
+              printf '%s' "${rows}"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
           exit "${fail}"
 
-      # Same glob the e2e workflows use, it has to pick up both files that keep
-      # the default name, no matter which folder they were written into
+      # Same glob the e2e workflows use, it has to pick up both files that keep the
+      # default name, no matter which folder they were written into. Without
+      # if-no-files-found the upload would only warn and the job would stay green.
       - name: Upload test artifacts
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: attributes-${{ matrix.runner }}
+          if-no-files-found: error
           path: |
             **/workflow-run-attributes.json
 
@@ -254,8 +280,19 @@ jobs:
           PARTIAL_ATTRIBUTES: ${{ steps.partial-attributes.outcome }}
           INVALID_EXTRA: ${{ steps.invalid-extra.outcome }}
         run: |
+          # The steps above fail on purpose, so the run collects their error
+          # annotations even when everything is correct. This table is the place
+          # to look, it is red only when a call that should have been rejected
+          # was accepted.
           set -uo pipefail
           fail=0
+
+          {
+            echo "## Input validation"
+            echo
+            echo "| call that must be rejected | rejected |"
+            echo "| --- | --- |"
+          } >> "${GITHUB_STEP_SUMMARY}"
 
           for pair in \
             "runs-on-gh-runner omitted:${MISSING_MODE}" \
@@ -263,17 +300,24 @@ jobs:
             "a provisioned run without any attribute:${NO_ATTRIBUTES}" \
             "a provisioned run with only os:${PARTIAL_ATTRIBUTES}" \
             "extra-attributes that is not JSON:${INVALID_EXTRA}"; do
+            name="${pair%:*}"
             outcome="${pair##*:}"
-            if [ "${outcome}" != "failure" ]; then
-              echo "::error::The action accepted ${pair%:*} (outcome '${outcome}')"
+            if [ "${outcome}" = "failure" ]; then
+              echo "| ${name} | yes |" >> "${GITHUB_STEP_SUMMARY}"
+            else
+              echo "| ${name} | **NO, it was accepted** |" >> "${GITHUB_STEP_SUMMARY}"
+              echo "::error::The action accepted ${name} (outcome '${outcome}')"
               fail=1
             fi
           done
 
           # A rejected call must not leave a file behind either
           if [ -f should-not-exist.json ]; then
+            echo "| no file written by a rejected call | **NO, the file exists** |" >> "${GITHUB_STEP_SUMMARY}"
             echo "::error::A rejected call still wrote should-not-exist.json"
             fail=1
+          else
+            echo "| no file written by a rejected call | yes |" >> "${GITHUB_STEP_SUMMARY}"
           fi
 
           exit "${fail}"
