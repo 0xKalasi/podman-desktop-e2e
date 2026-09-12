@@ -88,7 +88,8 @@ jobs:
           os: windows
           os-version: '2025'
           architecture: x86_64
-          extra-attributes: '{"podman-release": "6.0.2"}'
+          # podman-version collides on purpose, extra-attributes has to win over it
+          extra-attributes: '{"podman-release": "6.0.2", "podman-version": "7.0.0-rc1"}'
 
       # An input still wins over detection when the tests do run on the runner.
       # This is also the only call that exercises the filename and repository inputs.
@@ -187,6 +188,9 @@ jobs:
           check "${PROVISIONED_FILE}" platform        "windows-nt"
           check "${PROVISIONED_FILE}" podman-provider "hyperv"
           check "${PROVISIONED_FILE}" podman-release  "6.0.2"
+          # a key from extra-attributes overrides the generated one, the plain
+          # podman-version passthrough is asserted on the detected file above
+          check "${PROVISIONED_FILE}" podman-version  "7.0.0-rc1"
 
           # 3. inputs beat detection, architecture is the only one left to detect
           check "${OVERRIDDEN_FILE}" os           "fedora"
@@ -230,11 +234,15 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # Every call below leaves out exactly one thing, everything else is valid.
+      # Without podman-version the later calls would be rejected for that reason
+      # instead of the one they are meant to cover.
       - name: Reject a missing runs-on-gh-runner
         id: missing-mode
         continue-on-error: true
         uses: ./.github/actions/generate-test-attributes
         with:
+          podman-version: 6.0.2
           filename: should-not-exist.json
 
       - name: Reject an invalid runs-on-gh-runner
@@ -243,6 +251,15 @@ jobs:
         uses: ./.github/actions/generate-test-attributes
         with:
           runs-on-gh-runner: 'yes'
+          podman-version: 6.0.2
+          filename: should-not-exist.json
+
+      - name: Reject a missing podman-version
+        id: missing-version
+        continue-on-error: true
+        uses: ./.github/actions/generate-test-attributes
+        with:
+          runs-on-gh-runner: true
           filename: should-not-exist.json
 
       - name: Reject a provisioned run without any attribute
@@ -251,6 +268,7 @@ jobs:
         uses: ./.github/actions/generate-test-attributes
         with:
           runs-on-gh-runner: false
+          podman-version: 6.0.2
           filename: should-not-exist.json
 
       - name: Reject a provisioned run with only some attributes
@@ -259,6 +277,7 @@ jobs:
         uses: ./.github/actions/generate-test-attributes
         with:
           runs-on-gh-runner: false
+          podman-version: 6.0.2
           os: windows
           filename: should-not-exist.json
 
@@ -268,17 +287,32 @@ jobs:
         uses: ./.github/actions/generate-test-attributes
         with:
           runs-on-gh-runner: true
+          podman-version: 6.0.2
           extra-attributes: 'not json'
           filename: should-not-exist.json
 
-      - name: Verify every invalid call was rejected
+      # An unrecognised provider is a warning, not an error. A new provider must
+      # not break the callers just because this action has not heard of it yet.
+      - name: Accept an unrecognised podman-provider
+        id: unknown-provider
+        continue-on-error: true
+        uses: ./.github/actions/generate-test-attributes
+        with:
+          runs-on-gh-runner: true
+          podman-version: 6.0.2
+          podman-provider: hyper-v
+          filename: unknown-provider.json
+
+      - name: Verify how the invalid calls were handled
         shell: bash
         env:
           MISSING_MODE: ${{ steps.missing-mode.outcome }}
           INVALID_MODE: ${{ steps.invalid-mode.outcome }}
+          MISSING_VERSION: ${{ steps.missing-version.outcome }}
           NO_ATTRIBUTES: ${{ steps.no-attributes.outcome }}
           PARTIAL_ATTRIBUTES: ${{ steps.partial-attributes.outcome }}
           INVALID_EXTRA: ${{ steps.invalid-extra.outcome }}
+          UNKNOWN_PROVIDER: ${{ steps.unknown-provider.outcome }}
         run: |
           # The steps above fail on purpose, so the run collects their error
           # annotations even when everything is correct. This table is the place
@@ -290,13 +324,14 @@ jobs:
           {
             echo "## Input validation"
             echo
-            echo "| call that must be rejected | rejected |"
+            echo "| call | handled as expected |"
             echo "| --- | --- |"
           } >> "${GITHUB_STEP_SUMMARY}"
 
           for pair in \
             "runs-on-gh-runner omitted:${MISSING_MODE}" \
             "runs-on-gh-runner set to 'yes':${INVALID_MODE}" \
+            "podman-version omitted:${MISSING_VERSION}" \
             "a provisioned run without any attribute:${NO_ATTRIBUTES}" \
             "a provisioned run with only os:${PARTIAL_ATTRIBUTES}" \
             "extra-attributes that is not JSON:${INVALID_EXTRA}"; do
@@ -318,6 +353,21 @@ jobs:
             fail=1
           else
             echo "| no file written by a rejected call | yes |" >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+          # The unrecognised provider is the one call here that has to succeed, and
+          # the value has to reach the file untouched. The warning itself is not
+          # asserted, a later step cannot read the log of an earlier one.
+          if [ "${UNKNOWN_PROVIDER}" != "success" ]; then
+            echo "| unrecognised podman-provider accepted with a warning | **NO, it was rejected** |" >> "${GITHUB_STEP_SUMMARY}"
+            echo "::error::An unrecognised podman-provider was rejected, it is supposed to be a warning"
+            fail=1
+          elif [ "$(jq -r '."podman-provider" // ""' unknown-provider.json)" != "hyper-v" ]; then
+            echo "| unrecognised podman-provider written through | **NO, the value was changed** |" >> "${GITHUB_STEP_SUMMARY}"
+            echo "::error::unknown-provider.json does not carry the provider that was passed in"
+            fail=1
+          else
+            echo "| unrecognised podman-provider accepted with a warning | yes |" >> "${GITHUB_STEP_SUMMARY}"
           fi
 
           exit "${fail}"
