@@ -225,18 +225,19 @@ jobs:
           path: |
             **/workflow-run-attributes.json
 
-  # The guarantee the runs-on-gh-runner input exists for: a call that would tag the
-  # run with the wrong machine has to fail instead of quietly producing a file.
-  # None of this depends on the runner, one is enough.
+  # Which calls the action turns away and which it lets through. A call that would
+  # tag the run with the wrong machine has to fail instead of quietly producing a
+  # file, while a merely incomplete one has to keep working with a warning.
+  # None of this depends on the runner, one job is enough.
   validation:
     name: input validation
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Every call below leaves out exactly one thing, everything else is valid.
-      # Without podman-version the later calls would be rejected for that reason
-      # instead of the one they are meant to cover.
+      # Every rejected call below leaves out exactly one thing, everything else is
+      # valid. They all pass podman-version so that they stay representative of a
+      # real call and the log does not fill up with unrelated warnings.
       - name: Reject a missing runs-on-gh-runner
         id: missing-mode
         continue-on-error: true
@@ -252,14 +253,6 @@ jobs:
         with:
           runs-on-gh-runner: 'yes'
           podman-version: 6.0.2
-          filename: should-not-exist.json
-
-      - name: Reject a missing podman-version
-        id: missing-version
-        continue-on-error: true
-        uses: ./.github/actions/generate-test-attributes
-        with:
-          runs-on-gh-runner: true
           filename: should-not-exist.json
 
       - name: Reject a provisioned run without any attribute
@@ -291,6 +284,9 @@ jobs:
           extra-attributes: 'not json'
           filename: should-not-exist.json
 
+      # From here on the calls have to be accepted. Both inputs below are only
+      # warned about, the file is still written.
+
       # An unrecognised provider is a warning, not an error. A new provider must
       # not break the callers just because this action has not heard of it yet.
       - name: Accept an unrecognised podman-provider
@@ -303,7 +299,18 @@ jobs:
           podman-provider: hyper-v
           filename: unknown-provider.json
 
-      - name: Verify how the invalid calls were handled
+      # Not every test run involves podman, e.g. the update tests do not. Losing the
+      # whole attributes file over a missing podman version would cost more than the
+      # empty value, the run would not be recorded at all.
+      - name: Accept a missing podman-version
+        id: missing-version
+        continue-on-error: true
+        uses: ./.github/actions/generate-test-attributes
+        with:
+          runs-on-gh-runner: true
+          filename: missing-version.json
+
+      - name: Verify how each call was handled
         shell: bash
         env:
           MISSING_MODE: ${{ steps.missing-mode.outcome }}
@@ -314,10 +321,9 @@ jobs:
           INVALID_EXTRA: ${{ steps.invalid-extra.outcome }}
           UNKNOWN_PROVIDER: ${{ steps.unknown-provider.outcome }}
         run: |
-          # The steps above fail on purpose, so the run collects their error
-          # annotations even when everything is correct. This table is the place
-          # to look, it is red only when a call that should have been rejected
-          # was accepted.
+          # Some of the steps above fail on purpose, so the run collects their error
+          # annotations even when everything is correct. This table is the place to
+          # look, it is red only when a call was handled the wrong way round.
           set -uo pipefail
           fail=0
 
@@ -331,7 +337,6 @@ jobs:
           for pair in \
             "runs-on-gh-runner omitted:${MISSING_MODE}" \
             "runs-on-gh-runner set to 'yes':${INVALID_MODE}" \
-            "podman-version omitted:${MISSING_VERSION}" \
             "a provisioned run without any attribute:${NO_ATTRIBUTES}" \
             "a provisioned run with only os:${PARTIAL_ATTRIBUTES}" \
             "extra-attributes that is not JSON:${INVALID_EXTRA}"; do
@@ -368,6 +373,38 @@ jobs:
             fail=1
           else
             echo "| unrecognised podman-provider accepted with a warning | yes |" >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+          # A missing podman version costs that one attribute and nothing else, the
+          # file still has to be there with everything the runner could determine.
+          # The exact values belong to the attributes job, here it only has to be
+          # clear that the empty input did not wipe the rest of the file out.
+          if [ "${MISSING_VERSION}" != "success" ]; then
+            echo "| missing podman-version accepted with a warning | **NO, it was rejected** |" >> "${GITHUB_STEP_SUMMARY}"
+            echo "::error::A missing podman-version was rejected, it is supposed to be a warning"
+            fail=1
+          elif [ ! -f missing-version.json ]; then
+            echo "| missing podman-version still writes the file | **NO, there is no file** |" >> "${GITHUB_STEP_SUMMARY}"
+            echo "::error::The call without a podman-version did not write missing-version.json"
+            fail=1
+          else
+            empty=""
+            for key in os os-version platform architecture repository; do
+              if [ -z "$(jq -r --arg key "${key}" '.[$key] // ""' missing-version.json)" ]; then
+                empty="${empty} ${key}"
+              fi
+            done
+            if [ -n "$(jq -r '."podman-version" // ""' missing-version.json)" ]; then
+              echo "| missing podman-version stays empty | **NO, something filled it in** |" >> "${GITHUB_STEP_SUMMARY}"
+              echo "::error::missing-version.json has a podman-version that was never passed in"
+              fail=1
+            elif [ -n "${empty}" ]; then
+              echo "| missing podman-version keeps the rest of the file | **NO, also empty:${empty}** |" >> "${GITHUB_STEP_SUMMARY}"
+              echo "::error::missing-version.json lost these attributes as well:${empty}"
+              fail=1
+            else
+              echo "| missing podman-version accepted with a warning | yes |" >> "${GITHUB_STEP_SUMMARY}"
+            fi
           fi
 
           exit "${fail}"
