@@ -345,7 +345,7 @@ jobs:
             if [ "${outcome}" = "failure" ]; then
               echo "| ${name} | yes |" >> "${GITHUB_STEP_SUMMARY}"
             else
-              echo "| ${name} | **NO, it was accepted** |" >> "${GITHUB_STEP_SUMMARY}"
+              echo "| ${name} | **NO** |" >> "${GITHUB_STEP_SUMMARY}"
               echo "::error::The action accepted ${name} (outcome '${outcome}')"
               fail=1
             fi
