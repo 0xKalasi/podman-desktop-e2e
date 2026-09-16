@@ -105,6 +105,19 @@ jobs:
           os-version: '42'
           platform: linux
 
+      # The os input has to drive the platform even here, where the runner could be
+      # asked instead. On the windows and macos legs the runner would answer with a
+      # different platform than the one the os input describes.
+      - name: Generate attributes with the platform left to be derived
+        id: derived
+        uses: ./.github/actions/generate-test-attributes
+        with:
+          runs-on-gh-runner: true
+          filename: derived-attributes.json
+          podman-version: 6.0.2
+          os: fedora
+          os-version: '42'
+
       - name: Verify the generated attributes
         shell: bash
         env:
@@ -118,6 +131,7 @@ jobs:
           DETECTED_ATTRIBUTES: ${{ steps.detected.outputs.attributes }}
           PROVISIONED_FILE: ${{ steps.provisioned.outputs.attributes-file }}
           OVERRIDDEN_FILE: ${{ steps.overridden.outputs.attributes-file }}
+          DERIVED_FILE: ${{ steps.derived.outputs.attributes-file }}
         run: |
           # Every check runs, the step reports all of the failures at once. Each one
           # also lands in the job summary, that is the single place to look at first.
@@ -149,7 +163,7 @@ jobs:
             esac
           }
 
-          for file in "${DETECTED_FILE}" "${PROVISIONED_FILE}" "${OVERRIDDEN_FILE}"; do
+          for file in "${DETECTED_FILE}" "${PROVISIONED_FILE}" "${OVERRIDDEN_FILE}" "${DERIVED_FILE}"; do
             echo "::group::${file}"
             cat "${file}"
             echo "::endgroup::"
@@ -198,6 +212,11 @@ jobs:
           check "${OVERRIDDEN_FILE}" platform     "linux"
           check "${OVERRIDDEN_FILE}" repository   "podman-desktop-companion"
           check "${OVERRIDDEN_FILE}" architecture "${EXPECTED_ARCHITECTURE}"
+
+          # 4. the os input drives the platform, the runner is not asked for it.
+          # On windows and macos this is 'linux' only because 'fedora' says so.
+          check "${DERIVED_FILE}" os       "fedora"
+          check "${DERIVED_FILE}" platform "linux"
 
           {
             echo "## ${RUNNER_LABEL}"
@@ -284,6 +303,51 @@ jobs:
           extra-attributes: 'not json'
           filename: should-not-exist.json
 
+      # The upload globs are relative to the workspace, a file written outside of it
+      # would be missing from the artifact without anything going red.
+      - name: Reject a dir that leads out of the workspace
+        id: escaping-dir
+        continue-on-error: true
+        uses: ./.github/actions/generate-test-attributes
+        with:
+          runs-on-gh-runner: true
+          podman-version: 6.0.2
+          dir: ../escaped
+          filename: should-not-exist.json
+
+      # An absolute dir does not escape, it is concatenated onto the workspace and
+      # ends up as a subfolder. What breaks is the attributes-file output, it would
+      # name a path that nothing is written to.
+      - name: Reject an absolute dir
+        id: absolute-dir
+        continue-on-error: true
+        uses: ./.github/actions/generate-test-attributes
+        with:
+          runs-on-gh-runner: true
+          podman-version: 6.0.2
+          dir: /tmp/escaped
+          filename: should-not-exist.json
+
+      - name: Reject a filename that leads out of the workspace
+        id: escaping-filename
+        continue-on-error: true
+        uses: ./.github/actions/generate-test-attributes
+        with:
+          runs-on-gh-runner: true
+          podman-version: 6.0.2
+          filename: ../escaped-should-not-exist.json
+
+      # An expression that resolves to nothing is the way this happens in practice,
+      # the default only applies when the input is left out altogether.
+      - name: Reject an empty filename
+        id: empty-filename
+        continue-on-error: true
+        uses: ./.github/actions/generate-test-attributes
+        with:
+          runs-on-gh-runner: true
+          podman-version: 6.0.2
+          filename: ''
+
       # From here on the calls have to be accepted. Both inputs below are only
       # warned about, the file is still written.
 
@@ -319,6 +383,10 @@ jobs:
           NO_ATTRIBUTES: ${{ steps.no-attributes.outcome }}
           PARTIAL_ATTRIBUTES: ${{ steps.partial-attributes.outcome }}
           INVALID_EXTRA: ${{ steps.invalid-extra.outcome }}
+          ESCAPING_DIR: ${{ steps.escaping-dir.outcome }}
+          ABSOLUTE_DIR: ${{ steps.absolute-dir.outcome }}
+          ESCAPING_FILENAME: ${{ steps.escaping-filename.outcome }}
+          EMPTY_FILENAME: ${{ steps.empty-filename.outcome }}
           UNKNOWN_PROVIDER: ${{ steps.unknown-provider.outcome }}
         run: |
           # Some of the steps above fail on purpose, so the run collects their error
@@ -339,7 +407,11 @@ jobs:
             "runs-on-gh-runner set to 'yes':${INVALID_MODE}" \
             "a provisioned run without any attribute:${NO_ATTRIBUTES}" \
             "a provisioned run with only os:${PARTIAL_ATTRIBUTES}" \
-            "extra-attributes that is not JSON:${INVALID_EXTRA}"; do
+            "extra-attributes that is not JSON:${INVALID_EXTRA}" \
+            "a dir that leads out of the workspace:${ESCAPING_DIR}" \
+            "an absolute dir:${ABSOLUTE_DIR}" \
+            "a filename that leads out of the workspace:${ESCAPING_FILENAME}" \
+            "an empty filename:${EMPTY_FILENAME}"; do
             name="${pair%:*}"
             outcome="${pair##*:}"
             if [ "${outcome}" = "failure" ]; then
@@ -358,6 +430,22 @@ jobs:
             fail=1
           else
             echo "| no file written by a rejected call | yes |" >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+          # The point of rejecting those two paths, the file has to be somewhere the
+          # upload can still see. Checked from the workspace, where the action writes.
+          escaped=""
+          for path in ../escaped ../escaped-should-not-exist.json; do
+            if [ -e "${path}" ]; then
+              escaped="${escaped} ${path}"
+            fi
+          done
+          if [ -n "${escaped}" ]; then
+            echo "| nothing written outside the workspace | **NO, found:${escaped}** |" >> "${GITHUB_STEP_SUMMARY}"
+            echo "::error::A rejected call still wrote outside the workspace:${escaped}"
+            fail=1
+          else
+            echo "| nothing written outside the workspace | yes |" >> "${GITHUB_STEP_SUMMARY}"
           fi
 
           # The unrecognised provider is the one call here that has to succeed, and
